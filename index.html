@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+</head>
+<body>
+
+  <!-- 1. Connect Wallet Button -->
+  <button id="connectButton">Connect Wallet</button>
+  <p id="walletAddress"></p>
+
+  <!-- 2. CSV Upload (address, amount in ETH) -->
+  <input type="file" id="csvFileInput" accept=".csv" />
+  <p id="fileStatus"></p>
+
+  <!-- 3. Send Multisend Transaction -->
+  <button id="sendButton" disabled>Send Multisend</button>
+
+  <pre id="output"></pre>
+
+  <script>
+    // ====== Configuration ======
+    // Replace this with your deployed multisend contract address:
+    const MULTISEND_CONTRACT_ADDRESS = "0xcc61c6d3a2Dfd832825ECD54d1779A0e7A212A84";
+
+    // ====== Globals ======
+    let userAddress = null;
+    let parsedRows = []; // Array of { to: "0x...", amountWei: BigInt(...) }
+    let totalValueWei = BigInt(0);
+
+    // Utility constant: 1 ETH = 1e18 wei
+    const WEI_PER_ETH = BigInt("1000000000000000000");
+
+    // ====== Helper: parse a decimal ETH string into BigInt wei ======
+    function parseEther(amountStr) {
+      // Remove any whitespace
+      amountStr = amountStr.trim();
+      if (amountStr === "") {
+        throw new Error("Empty amount");
+      }
+      if (!amountStr.includes(".")) {
+        // No decimal point, just multiply by 1e18
+        if (!/^\d+$/.test(amountStr)) {
+          throw new Error("Invalid ETH amount: " + amountStr);
+        }
+        return BigInt(amountStr) * WEI_PER_ETH;
+      }
+      const parts = amountStr.split(".");
+      if (parts.length !== 2) {
+        throw new Error("Invalid ETH amount: " + amountStr);
+      }
+      const whole = parts[0];
+      let fraction = parts[1];
+      if (!/^\d+$/.test(whole) || !/^\d+$/.test(fraction)) {
+        throw new Error("Invalid ETH amount: " + amountStr);
+      }
+      // Pad or truncate fraction to 18 decimal places
+      if (fraction.length > 18) {
+        fraction = fraction.slice(0, 18);
+      } else {
+        fraction = fraction.padEnd(18, "0");
+      }
+      const wholeWei = BigInt(whole) * WEI_PER_ETH;
+      const fractionWei = BigInt(fraction);
+      return wholeWei + fractionWei;
+    }
+
+    // ====== Connect Wallet ======
+    async function connectWallet() {
+      if (!window.ethereum) {
+        alert("MetaMask or another Ethereum wallet is required.");
+        return;
+      }
+      try {
+        const accounts = await window.ethereum.request({
+          method: "eth_requestAccounts",
+        });
+        userAddress = accounts[0];
+        document.getElementById("walletAddress").innerText =
+          "Connected: " + userAddress;
+        // Enable send button only if CSV already parsed
+        if (parsedRows.length > 0) {
+          document.getElementById("sendButton").disabled = false;
+        }
+      } catch (err) {
+        console.error(err);
+        alert("User rejected wallet connection.");
+      }
+    }
+
+    document
+      .getElementById("connectButton")
+      .addEventListener("click", connectWallet);
+
+    // ====== Handle CSV Upload ======
+    document
+      .getElementById("csvFileInput")
+      .addEventListener("change", handleFileUpload);
+
+    function handleFileUpload(event) {
+      const file = event.target.files[0];
+      if (!file) {
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = function (e) {
+        const text = e.target.result;
+        try {
+          parseCSV(text);
+          document.getElementById("fileStatus").innerText =
+            "CSV parsed: " + parsedRows.length + " rows.";
+          if (userAddress && parsedRows.length > 0) {
+            document.getElementById("sendButton").disabled = false;
+          }
+        } catch (err) {
+          document.getElementById("fileStatus").innerText =
+            "Error parsing CSV: " + err.message;
+          parsedRows = [];
+          totalValueWei = BigInt(0);
+          document.getElementById("sendButton").disabled = true;
+        }
+      };
+      reader.readAsText(file);
+    }
+
+    function parseCSV(csvText) {
+      parsedRows = [];
+      totalValueWei = BigInt(0);
+
+      // Split lines and ignore empty lines
+      const lines = csvText
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const parts = line.split(",");
+        if (parts.length !== 2) {
+          throw new Error(
+            `Line ${i + 1} is invalid (must contain exactly 2 comma-separated values).`
+          );
+        }
+        const rawAddress = parts[0].trim();
+        const rawAmount = parts[1].trim();
+
+        // Basic address validation
+        if (!/^0x[a-fA-F0-9]{40}$/.test(rawAddress)) {
+          throw new Error(`Line ${i + 1}: Invalid address "${rawAddress}".`);
+        }
+
+        // Parse ETH amount into wei
+        let amountWei;
+        try {
+          amountWei = parseEther(rawAmount);
+        } catch (err) {
+          throw new Error(`Line ${i + 1}: ${err.message}`);
+        }
+
+        parsedRows.push({
+          to: rawAddress.toLowerCase(),
+          amountWei: amountWei,
+        });
+        totalValueWei += amountWei;
+      }
+
+      if (parsedRows.length === 0) {
+        throw new Error("CSV contains no valid rows.");
+      }
+    }
+
+    // ====== Build Multisend Calldata ======
+    function buildMultisendData() {
+      // Each entry is 20 bytes (address) + 32 bytes (uint256 amount)
+      // We will concatenate hex strings without 0x
+      let dataHex = "";
+      for (const row of parsedRows) {
+        // Address: strip “0x”, pad to 40 hex chars
+        let addrNoPrefix = row.to.slice(2);
+        if (addrNoPrefix.length !== 40) {
+          throw new Error("Address length incorrect: " + row.to);
+        }
+        const paddedAddr = addrNoPrefix.toLowerCase().padStart(40, "0");
+
+        // Amount: convert BigInt to hex, strip leading “0x”, pad to 64 hex chars
+        let amtHex = row.amountWei.toString(16);
+        if (amtHex.length > 64) {
+          throw new Error("Amount hex too long for 32 bytes: " + amtHex);
+        }
+        amtHex = amtHex.padStart(64, "0");
+
+        dataHex += paddedAddr + amtHex;
+      }
+      return "0x" + dataHex;
+    }
+
+    // ====== Send Multisend Transaction ======
+    async function sendMultisend() {
+      if (!window.ethereum) {
+        alert("Ethereum wallet is required.");
+        return;
+      }
+      if (!userAddress) {
+        alert("Please connect your wallet first.");
+        return;
+      }
+      if (parsedRows.length === 0) {
+        alert("Please upload a valid CSV first.");
+        return;
+      }
+
+      let data;
+      try {
+        data = buildMultisendData();
+      } catch (err) {
+        document.getElementById("output").innerText =
+          "Error building data: " + err.message;
+        return;
+      }
+
+      const txParams = {
+        from: userAddress,
+        to: MULTISEND_CONTRACT_ADDRESS,
+        value: "0x" + totalValueWei.toString(16),
+        data: data,
+      };
+
+      try {
+        const txHash = await window.ethereum.request({
+          method: "eth_sendTransaction",
+          params: [txParams],
+        });
+        document.getElementById(
+          "output"
+        ).innerText = `Transaction sent. Tx hash:\n${txHash}`;
+      } catch (err) {
+        document.getElementById("output").innerText =
+          "Error sending transaction:\n" + err.message;
+      }
+    }
+
+    document
+      .getElementById("sendButton")
+      .addEventListener("click", sendMultisend);
+  </script>
+</body>
+</html>
