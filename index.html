@@ -9,11 +9,16 @@
   <button id="connectButton">Connect Wallet</button>
   <p id="walletAddress"></p>
 
-  <!-- 2. CSV Upload (address, amount in ETH) -->
+  <!-- 2. CSV Upload (addresses only) -->
   <input type="file" id="csvFileInput" accept=".csv" />
   <p id="fileStatus"></p>
 
-  <!-- 3. Send Multisend Transaction -->
+  <!-- 3. Total Amount Input -->
+  <label for="totalAmountInput">Total ETH to Send:</label>
+  <input type="text" id="totalAmountInput" placeholder="e.g. 1.5" />
+  <p id="amountStatus"></p>
+
+  <!-- 4. Send Multisend Button -->
   <button id="sendButton" disabled>Send Multisend</button>
 
   <pre id="output"></pre>
@@ -24,10 +29,9 @@
 
     // ====== Globals ======
     let userAddress = null;
-    let parsedRows = []; // Array of { to: "0x...", amountWei: BigInt(...) }
+    let parsedAddresses = []; // Array of address strings
     let totalValueWei = BigInt(0);
 
-    // 1 ETH = 10^18 wei
     const WEI_PER_ETH = BigInt("1000000000000000000");
 
     // ====== Helper: parse decimal ETH string into BigInt wei ======
@@ -63,9 +67,7 @@
         userAddress = accounts[0];
         document.getElementById("walletAddress").innerText =
           "Connected: " + userAddress;
-        if (parsedRows.length > 0) {
-          document.getElementById("sendButton").disabled = false;
-        }
+        updateSendButtonState();
       } catch (err) {
         console.error(err);
         alert("User rejected wallet connection.");
@@ -92,25 +94,20 @@
         try {
           parseCSV(text);
           document.getElementById("fileStatus").innerText =
-            "CSV parsed: " + parsedRows.length + " rows.";
-          if (userAddress && parsedRows.length > 0) {
-            document.getElementById("sendButton").disabled = false;
-          }
+            "CSV parsed: " + parsedAddresses.length + " addresses.";
+          updateSendButtonState();
         } catch (err) {
           document.getElementById("fileStatus").innerText =
             "Error parsing CSV: " + err.message;
-          parsedRows = [];
-          totalValueWei = BigInt(0);
-          document.getElementById("sendButton").disabled = true;
+          parsedAddresses = [];
+          updateSendButtonState();
         }
       };
       reader.readAsText(file);
     }
 
     function parseCSV(csvText) {
-      parsedRows = [];
-      totalValueWei = BigInt(0);
-
+      parsedAddresses = [];
       const lines = csvText
         .split(/\r?\n/)
         .map((l) => l.trim())
@@ -119,57 +116,53 @@
       if (lines.length === 0) {
         throw new Error("CSV is empty.");
       }
-
       for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const parts = line.split(",");
-        if (parts.length !== 2) {
-          throw new Error(
-            `Line ${i + 1} is invalid. Each line must have exactly 2 values separated by a comma.`
-          );
-        }
-        const rawAddress = parts[0].trim();
-        const rawAmount = parts[1].trim();
-
-        // Validate address: must be 0x followed by 40 hex chars
+        const rawAddress = lines[i];
         if (!/^0x[a-fA-F0-9]{40}$/.test(rawAddress)) {
           throw new Error(`Line ${i + 1}: Invalid address "${rawAddress}".`);
         }
-        const to = rawAddress.toLowerCase();
-
-        // Parse ETH amount
-        let amountWei;
-        try {
-          amountWei = parseEther(rawAmount);
-        } catch (err) {
-          throw new Error(`Line ${i + 1}: ${err.message}`);
-        }
-        if (amountWei <= 0) {
-          throw new Error(`Line ${i + 1}: Amount must be > 0.`);
-        }
-
-        parsedRows.push({ to, amountWei });
-        totalValueWei += amountWei;
+        parsedAddresses.push(rawAddress.toLowerCase());
       }
-
-      if (parsedRows.length === 0) {
-        throw new Error("CSV contains no valid rows.");
+      if (parsedAddresses.length === 0) {
+        throw new Error("No valid addresses found.");
       }
     }
 
-    // ====== Build Multisend Calldata ======
+    // ====== Handle Total Amount Input ======
+    document
+      .getElementById("totalAmountInput")
+      .addEventListener("input", handleAmountInput);
+
+    function handleAmountInput(event) {
+      const raw = event.target.value;
+      try {
+        const wei = parseEther(raw);
+        if (wei <= 0) throw new Error("Amount must be > 0.");
+        totalValueWei = wei;
+        document.getElementById("amountStatus").innerText =
+          "Parsed total: " + totalValueWei.toString() + " wei.";
+      } catch (err) {
+        document.getElementById("amountStatus").innerText =
+          "Invalid total amount: " + err.message;
+        totalValueWei = BigInt(0);
+      }
+      updateSendButtonState();
+    }
+
+    // ====== Enable/Disable Send Button ======
+    function updateSendButtonState() {
+      const hasWallet = Boolean(userAddress);
+      const hasAddresses = parsedAddresses.length > 0;
+      const hasAmount = totalValueWei > BigInt(0);
+      document.getElementById("sendButton").disabled = !(hasWallet && hasAddresses && hasAmount);
+    }
+
+    // ====== Build Multisend Calldata (addresses only) ======
     function buildMultisendData() {
-      // Each entry: 20-byte address + 32-byte amount
+      // Concatenate 20-byte address hex (no amount field)
       let dataHex = "";
-      for (const row of parsedRows) {
-        let addrNoPrefix = row.to.slice(2);
-        const paddedAddr = addrNoPrefix.toLowerCase().padStart(40, "0");
-        let amtHex = row.amountWei.toString(16);
-        if (amtHex.length > 64) {
-          throw new Error("Amount too large for 32 bytes: " + amtHex);
-        }
-        amtHex = amtHex.padStart(64, "0");
-        dataHex += paddedAddr + amtHex;
+      for (const addr of parsedAddresses) {
+        dataHex += addr.slice(2).toLowerCase().padStart(40, "0");
       }
       return "0x" + dataHex;
     }
@@ -184,12 +177,16 @@
         alert("Please connect your wallet first.");
         return;
       }
-      if (parsedRows.length === 0) {
-        alert("Please upload and parse a valid CSV first.");
+      if (parsedAddresses.length === 0) {
+        alert("Please upload a valid CSV of addresses first.");
+        return;
+      }
+      if (totalValueWei <= 0) {
+        alert("Please enter a total amount > 0.");
         return;
       }
 
-      // Validate total ETH in wallet >= totalValueWei
+      // Check user balance >= totalValueWei
       try {
         const balanceHex = await window.ethereum.request({
           method: "eth_getBalance",
@@ -217,6 +214,7 @@
         return;
       }
 
+      // Prepare transaction: value = totalValueWei, data = addresses-only calldata
       const txParams = {
         from: userAddress,
         to: MULTISEND_CONTRACT_ADDRESS,
@@ -229,9 +227,8 @@
           method: "eth_sendTransaction",
           params: [txParams],
         });
-        document.getElementById(
-          "output"
-        ).innerText = `Transaction sent: ${txHash}`;
+        document.getElementById("output").innerText =
+          "Transaction sent: " + txHash;
       } catch (err) {
         document.getElementById("output").innerText =
           "Error sending transaction: " + err.message;
